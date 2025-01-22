@@ -24,10 +24,11 @@
 if not config then
   config = {
       debug = true,
-      publicKey = nil,
+      publicKeys = {},
       issuer = nil,
       audience = nil,
-      hmacSecret = nil
+      hmacSecret = nil,
+      keyPaths = nil
   }
 end
 
@@ -130,12 +131,20 @@ local function algorithmIsValid(token)
   return true
 end
 
-local function rs256SignatureIsValid(token, publicKey)
+local function rs256SignatureIsValid(token, publicKeys)
   local digest = openssl.digest.new('SHA256')
   digest:update(token.header .. '.' .. token.payload)
-  local vkey = openssl.pkey.new(publicKey)
-  local isVerified = vkey:verify(token.signaturedecoded, digest)
-  return isVerified
+  
+  -- Try each public key until we find one that works
+  for _, publicKey in ipairs(publicKeys) do
+    local vkey = openssl.pkey.new(publicKey)
+    local isVerified = vkey:verify(token.signaturedecoded, digest)
+    if isVerified then
+      return true
+    end
+  end
+  
+  return false
 end
 
 local function hs256SignatureIsValid(token, secret)
@@ -195,7 +204,6 @@ local function setVariablesFromPayload(txn, decodedPayload)
 end
 
 local function jwtverify(txn)
-  local pem = config.publicKey
   local issuer = config.issuer
   local audience = config.audience
   local hmacSecret = config.hmacSecret
@@ -219,8 +227,8 @@ local function jwtverify(txn)
 
   -- 3. Verify the signature with the certificate
   if token.headerdecoded.alg == 'RS256' then
-    if rs256SignatureIsValid(token, pem) == false then
-      log("Signature not valid.")
+    if rs256SignatureIsValid(token, config.publicKeys) == false then
+      log("Signature not valid for any provided public key.")
       goto out
     end
   elseif token.headerdecoded.alg == 'HS256' then
@@ -271,20 +279,25 @@ end
 core.register_init(function()
   config.issuer = os.getenv("OAUTH_ISSUER")
   config.audience = os.getenv("OAUTH_AUDIENCE")
+  config.keyPaths = os.getenv("OAUTH_KEY_PATHS")
   
-  -- when using an RS256 signature
-  local publicKeyPath = os.getenv("OAUTH_PUBKEY_PATH") 
-  if publicKeyPath ~= nil then
-    local pem = readAll(publicKeyPath)
-    config.publicKey = pem
+  -- Load all public keys from the provided paths
+  if config.keyPaths ~= nil then
+    local paths = core.tokenize(config.keyPaths, " ")
+    for _, path in ipairs(paths) do
+      local pem = readAll(path)
+      table.insert(config.publicKeys, pem)
+      log("Loaded public key from: " .. path)
+    end
   end
   
   -- when using an HS256 or HS512 signature
   config.hmacSecret = os.getenv("OAUTH_HMAC_SECRET")
   
-  log("PublicKeyPath: " .. (publicKeyPath or "<none>"))
   log("Issuer: " .. (config.issuer or "<none>"))
   log("Audience: " .. (config.audience or "<none>"))
+  log("KeyPaths: " .. (config.keyPaths or "<none>"))
+  log("Number of public keys loaded: " .. #config.publicKeys)
 end)
 
 -- Called on a request.
