@@ -64,6 +64,27 @@ local function dump(o)
   end
 end
 
+-- Emits one warning line through HAProxy's log directive so ops can see why
+-- a JWT was rejected without enabling Lua debug mode (which only writes to
+-- stderr when haproxy is started with -d). Restricted to non-PII claims:
+-- iss, aud, exp, kid. token may be nil when decoding failed.
+local function logFail(reason, token)
+  local iss, aud, exp, kid = "?", "?", "?", "?"
+  if token ~= nil then
+    if token.payloaddecoded ~= nil then
+      iss = tostring(token.payloaddecoded.iss or "?")
+      aud = dump(token.payloaddecoded.aud or "?")
+      exp = tostring(token.payloaddecoded.exp or "?")
+    end
+    if token.headerdecoded ~= nil then
+      kid = tostring(token.headerdecoded.kid or "?")
+    end
+  end
+  core.log(core.warning, string.format(
+    "jwtverify reject reason=%s iss=%s aud=%s exp=%s now=%s kid=%s",
+    reason, iss, aud, exp, tostring(core.now().sec), kid))
+end
+
 -- Loops through array to find the given string.
 -- items: array of strings
 -- test_str: string to search for
@@ -207,12 +228,14 @@ local function jwtverify(txn)
   local issuer = config.issuer
   local audience = config.audience
   local hmacSecret = config.hmacSecret
+  local failReason = nil
 
   -- 1. Decode and parse the JWT
   local token = decodeJwt(txn.sf:req_hdr("Authorization"))
 
   if token == nil then
     log("Token could not be decoded.")
+    failReason = "decode"
     goto out
   end
 
@@ -222,6 +245,7 @@ local function jwtverify(txn)
   -- 2. Verify the signature algorithm is supported (HS256, HS512, RS256)
   if algorithmIsValid(token) == false then
       log("Algorithm not valid.")
+      failReason = "algorithm"
       goto out
   end
 
@@ -229,16 +253,19 @@ local function jwtverify(txn)
   if token.headerdecoded.alg == 'RS256' then
     if rs256SignatureIsValid(token, config.publicKeys) == false then
       log("Signature not valid for any provided public key.")
+      failReason = "signature"
       goto out
     end
   elseif token.headerdecoded.alg == 'HS256' then
     if hs256SignatureIsValid(token, hmacSecret) == false then
       log("Signature not valid.")
+      failReason = "signature"
       goto out
     end
   elseif token.headerdecoded.alg == 'HS512' then
     if hs512SignatureIsValid(token, hmacSecret) == false then
       log("Signature not valid.")
+      failReason = "signature"
       goto out
     end
   end
@@ -246,18 +273,21 @@ local function jwtverify(txn)
   -- 4. Verify that the token is not expired
   if expirationIsValid(token) == false then
     log("Token is expired.")
+    failReason = "expired"
     goto out
   end
 
   -- 5. Verify the issuer
   if issuer ~= nil and issuerIsValid(token, issuer) == false then
     log("Issuer not valid.")
+    failReason = "issuer"
     goto out
   end
 
   -- 6. Verify the audience
   if audience ~= nil and audienceIsValid(token, audience) == false then
     log("Audience not valid.")
+    failReason = "audience"
     goto out
   end
 
@@ -271,6 +301,7 @@ local function jwtverify(txn)
   -- way out. Display a message when running in debug mode
 ::out::
  log("req.authorized = false")
+ logFail(failReason or "unknown", token)
  txn.set_var(txn, "txn.authorized", false)
 end
 
