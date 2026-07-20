@@ -136,26 +136,12 @@ local function algorithmIsValid(token)
   return true
 end
 
-local function rs256SignatureIsValid(token, parsedKeys, publicKeys)
+local function rs256SignatureIsValid(token, parsedKeys)
   local digest = openssl.digest.new('SHA256')
   digest:update(token.header .. '.' .. token.payload)
 
-  -- Prefer keys parsed once at init; fall back to parsing on demand if the
-  -- pre-parse step produced nothing (e.g. a key format openssl.pkey rejected).
-  if parsedKeys ~= nil and #parsedKeys > 0 then
-    for _, vkey in ipairs(parsedKeys) do
-      if vkey:verify(token.signaturedecoded, digest) then
-        return true
-      end
-    end
-    return false
-  end
-
-  -- Fallback: parse each PEM per request (original behaviour)
-  for _, publicKey in ipairs(publicKeys) do
-    local vkey = openssl.pkey.new(publicKey)
-    local isVerified = vkey:verify(token.signaturedecoded, digest)
-    if isVerified then
+  for _, vkey in ipairs(parsedKeys) do
+    if vkey:verify(token.signaturedecoded, digest) then
       return true
     end
   end
@@ -306,7 +292,7 @@ local function jwtverify(txn)
 
   -- 3. Verify the signature with the certificate
   if token.headerdecoded.alg == 'RS256' then
-    if rs256SignatureIsValid(token, config.parsedKeys, config.publicKeys) == false then
+    if rs256SignatureIsValid(token, config.parsedKeys) == false then
       log("Signature not valid for any provided public key.")
       goto out
     end
@@ -384,16 +370,22 @@ core.register_init(function()
 
   -- Pre-parse the PEMs into key objects once, so signature verification does
   -- not rebuild them on every request (they are immutable for the process
-  -- lifetime). rs256SignatureIsValid falls back to per-request parsing if this
-  -- yields nothing.
+  -- lifetime). A key that fails to parse here could never have verified a
+  -- signature anyway, so alert loudly; if none parse, abort startup rather
+  -- than run a proxy that rejects every RS256 token.
   config.parsedKeys = {}
-  for _, pem in ipairs(config.publicKeys) do
+  for i, pem in ipairs(config.publicKeys) do
     local ok, vkey = pcall(openssl.pkey.new, pem)
     if ok and vkey ~= nil then
       table.insert(config.parsedKeys, vkey)
     else
-      log("Failed to pre-parse a public key; will fall back to per-request parse.")
+      core.Alert("jwtverify: failed to parse public key " .. i .. " of "
+        .. #config.publicKeys .. ": " .. tostring(vkey))
     end
+  end
+  if #config.publicKeys > 0 and #config.parsedKeys == 0 then
+    error("jwtverify: none of the " .. #config.publicKeys
+      .. " configured public keys could be parsed; aborting startup")
   end
   
   -- when using an HS256 or HS512 signature
