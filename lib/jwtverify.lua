@@ -51,6 +51,12 @@ local function log(msg)
   end
 end
 
+-- Denial reasons and cache flushes log unconditionally: with debug off (the
+-- default) the proxy must still record *why* a request was rejected.
+local function warn(msg)
+  core.Warning(tostring(msg))
+end
+
 local function dump(o)
   if type(o) == 'table' then
      local s = '{ '
@@ -94,12 +100,12 @@ local function decodeJwt(authorizationHeader)
   local headerFields = core.tokenize(authorizationHeader, " .")
 
   if #headerFields ~= 4 then
-      log("Improperly formated Authorization header. Should be 'Bearer' followed by 3 token sections.")
+      warn("Improperly formated Authorization header. Should be 'Bearer' followed by 3 token sections.")
       return nil
   end
 
   if headerFields[1] ~= 'Bearer' then
-      log("Improperly formated Authorization header. Missing 'Bearer' property.")
+      warn("Improperly formated Authorization header. Missing 'Bearer' property.")
       return nil
   end
 
@@ -126,10 +132,10 @@ end
 
 local function algorithmIsValid(token)
   if token.headerdecoded.alg == nil then
-      log("No 'alg' provided in JWT header.")
+      warn("No 'alg' provided in JWT header.")
       return false
   elseif token.headerdecoded.alg ~= 'HS256' and  token.headerdecoded.alg ~= 'HS512' and token.headerdecoded.alg ~= 'RS256' then
-      log("HS256, HS512 and RS256 supported. Incorrect alg in JWT: " .. token.headerdecoded.alg)
+      warn("HS256, HS512 and RS256 supported. Incorrect alg in JWT: " .. token.headerdecoded.alg)
       return false
   end
 
@@ -247,6 +253,10 @@ local function verifiedCachePut(key, payload, exp)
       -- Worst case we re-verify a few tokens -- correctness is unaffected.
       verifiedCachePurgeExpired(core.now().sec)
       if verifiedCacheSize >= VERIFIED_CACHE_MAX then
+        -- Loud on purpose: a working set of live tokens above the cap means
+        -- periodic full re-verification (CPU sawtooth), not a correctness bug.
+        warn("jwtverify: verified-token cache flushed at " .. verifiedCacheSize
+          .. " live entries; working set exceeds VERIFIED_CACHE_MAX")
         verifiedCache = {}
         verifiedCacheSize = 0
       end
@@ -300,36 +310,36 @@ local function jwtverify(txn)
   -- 3. Verify the signature with the certificate
   if token.headerdecoded.alg == 'RS256' then
     if rs256SignatureIsValid(token, config.parsedKeys) == false then
-      log("Signature not valid for any provided public key.")
+      warn("Signature not valid for any provided public key.")
       goto out
     end
   elseif token.headerdecoded.alg == 'HS256' then
     if hs256SignatureIsValid(token, hmacSecret) == false then
-      log("Signature not valid.")
+      warn("Signature not valid.")
       goto out
     end
   elseif token.headerdecoded.alg == 'HS512' then
     if hs512SignatureIsValid(token, hmacSecret) == false then
-      log("Signature not valid.")
+      warn("Signature not valid.")
       goto out
     end
   end
 
   -- 4. Verify that the token is not expired
   if expirationIsValid(token) == false then
-    log("Token is expired.")
+    warn("Token is expired.")
     goto out
   end
 
   -- 5. Verify the issuer
   if issuer ~= nil and issuerIsValid(token, issuer) == false then
-    log("Issuer not valid.")
+    warn("Issuer not valid.")
     goto out
   end
 
   -- 6. Verify the audience
   if audience ~= nil and audienceIsValid(token, audience) == false then
-    log("Audience not valid.")
+    warn("Audience not valid.")
     goto out
   end
 

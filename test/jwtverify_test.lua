@@ -186,7 +186,7 @@ end
 --------------------------------------------------------------------------------
 -- Shared fake state (verify-call counter, alert counter, clock)
 --------------------------------------------------------------------------------
-local state = { verifyCount = 0, alertCount = 0, now = 1000000 }
+local state = { verifyCount = 0, alertCount = 0, warnCount = 0, now = 1000000 }
 
 --------------------------------------------------------------------------------
 -- package.preload stubs (installed once; jwtverify require()s these by name)
@@ -264,6 +264,7 @@ end
 _G.core = {
   Debug = function(_) end,
   Alert = function(_) state.alertCount = state.alertCount + 1 end,
+  Warning = function(_) state.warnCount = state.warnCount + 1 end,
   tokenize = tokenize,
   now = function() return { sec = state.now } end,
   register_init = function(fn) captured.init = fn end,
@@ -388,11 +389,13 @@ do
   -- Signature decodes to something other than "VALIDSIG" -> fake verify fails.
   local tok = makeToken(RS256, { iss = ISSUER, aud = AUDIENCE, exp = state.now + 3600 }, "TAMPERED")
   local before = state.verifyCount
+  local warns0 = state.warnCount
   local txn = makeTxn(tok)
   action(txn)
   check(state.verifyCount == before + 1, "signature verify WAS attempted (cache miss)")
   check(txn.vars["txn.authorized"] == false, "authorized == false")
   check(txn.vars["txn.oauth_cache"] == nil, "denied request leaves oauth_cache unset")
+  check(state.warnCount == warns0 + 1, "denial reason warned unconditionally (debug off)")
 end
 
 -- 4a. Expired token is denied.
@@ -403,9 +406,11 @@ do
 
   -- 4a
   local expiredTok = makeToken(RS256, { iss = ISSUER, aud = AUDIENCE, exp = state.now - 10 }, "VALIDSIG")
+  local warns0 = state.warnCount
   local txnE = makeTxn(expiredTok)
   action(txnE)
   check(txnE.vars["txn.authorized"] == false, "already-expired token denied")
+  check(state.warnCount == warns0 + 1, "expiry denial warned unconditionally (debug off)")
 
   -- 4b: cache while valid, then advance the clock past exp.
   local exp = state.now + 100
@@ -452,6 +457,7 @@ do
   local action = freshVerifier()
   local far = state.now + 1000000
   local n = 8193
+  local warns0 = state.warnCount
   for i = 1, n do
     local tok = makeToken(RS256, { iss = ISSUER, aud = AUDIENCE, exp = far, n = i }, "VALIDSIG")
     local txn = makeTxn(tok)
@@ -462,6 +468,9 @@ do
     end
   end
   check(true, "filled " .. n .. " entries with no error")
+  -- All entries are live (far exp), so crossing the cap must take the
+  -- clear-on-full branch, which warns unconditionally.
+  check(state.warnCount == warns0 + 1, "clear-on-full flush emitted a warning")
 
   -- A fresh valid token still authorizes after the cap was crossed.
   local tok = makeToken(RS256, { iss = ISSUER, aud = AUDIENCE, exp = far, n = "post" }, "VALIDSIG")
