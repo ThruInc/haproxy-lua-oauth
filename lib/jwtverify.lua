@@ -23,7 +23,7 @@
 -- Default/fallback config
 if not config then
   config = {
-      debug = true,
+      debug = false,
       publicKeys = {},
       issuer = nil,
       audience = nil,
@@ -113,8 +113,13 @@ local function decodeJwt(authorizationHeader)
   token.signature = headerFields[4]
   token.signaturedecoded = base64.decode(token.signature)
 
-  log('Decoded JWT header: ' .. dump(token.headerdecoded))
-  log('Decoded JWT payload: ' .. dump(token.payloaddecoded))
+  -- Guard the dump() calls: Lua evaluates arguments eagerly, so without this
+  -- the recursive dump() + string concat ran on every request even when
+  -- debug logging was disabled.
+  if config.debug then
+    log('Decoded JWT header: ' .. dump(token.headerdecoded))
+    log('Decoded JWT payload: ' .. dump(token.payloaddecoded))
+  end
 
   return token
 end
@@ -291,6 +296,12 @@ core.register_init(function()
   config.issuer = os.getenv("OAUTH_ISSUER")
   config.audience = os.getenv("OAUTH_AUDIENCE")
   config.keyPaths = os.getenv("OAUTH_KEY_PATHS")
+
+  -- Debug defaults off (see fallback config). Set OAUTH_DEBUG=true to re-enable
+  -- verbose per-request logging.
+  if os.getenv("OAUTH_DEBUG") ~= nil then
+    config.debug = (os.getenv("OAUTH_DEBUG") == "true")
+  end
   
   -- Load all public keys from the provided paths
   if config.keyPaths ~= nil then
