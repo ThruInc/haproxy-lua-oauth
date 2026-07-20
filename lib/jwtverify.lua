@@ -219,13 +219,76 @@ local function setVariablesFromPayload(txn, decodedPayload)
   end
 end
 
+-- In-process cache of successfully verified tokens.
+--
+-- Key   = the exact Authorization header value (full "Bearer <jwt>").
+-- Value = { payload = <decoded claims>, exp = <numeric exp> }.
+--
+-- Only positive results are cached, keyed on the exact token bytes: a tampered
+-- or forged token differs by at least one byte, so it can never collide with a
+-- cached entry -- it misses the cache and goes through full signature
+-- verification (and is rejected). Expiry is re-checked on every hit, so an
+-- entry is never honoured past the token's own 'exp'; the effective revocation
+-- window therefore equals the token lifetime.
+--
+-- Under 'lua-load' this table lives in the single shared Lua state and is
+-- coherent across threads (Lua runs under HAProxy's global lock). Under
+-- 'lua-load-per-thread' each thread keeps its own cache -- still correct, just
+-- a lower hit rate.
+local verifiedCache = {}
+local verifiedCacheSize = 0
+local VERIFIED_CACHE_MAX = 8192
+
+local function verifiedCachePurgeExpired(now)
+  for k, v in pairs(verifiedCache) do
+    if v.exp <= now then
+      verifiedCache[k] = nil
+      verifiedCacheSize = verifiedCacheSize - 1
+    end
+  end
+end
+
+local function verifiedCachePut(key, payload, exp)
+  if verifiedCache[key] == nil then
+    if verifiedCacheSize >= VERIFIED_CACHE_MAX then
+      -- Bounded: drop expired entries first; if still full, clear the table.
+      -- Worst case we re-verify a few tokens -- correctness is unaffected.
+      verifiedCachePurgeExpired(core.now().sec)
+      if verifiedCacheSize >= VERIFIED_CACHE_MAX then
+        verifiedCache = {}
+        verifiedCacheSize = 0
+      end
+    end
+    verifiedCacheSize = verifiedCacheSize + 1
+  end
+  verifiedCache[key] = { payload = payload, exp = exp }
+end
+
 local function jwtverify(txn)
   local issuer = config.issuer
   local audience = config.audience
   local hmacSecret = config.hmacSecret
 
+  local authHeader = txn.sf:req_hdr("Authorization")
+
+  -- Fast path: a token we have already fully verified and that has not yet
+  -- expired. Skips JSON decode and signature verification entirely.
+  if authHeader ~= nil then
+    local cached = verifiedCache[authHeader]
+    if cached ~= nil then
+      if cached.exp > core.now().sec then
+        setVariablesFromPayload(txn, cached.payload)
+        txn.set_var(txn, "txn.authorized", true)
+        return
+      end
+      -- Expired: drop it and fall through to full verification.
+      verifiedCache[authHeader] = nil
+      verifiedCacheSize = verifiedCacheSize - 1
+    end
+  end
+
   -- 1. Decode and parse the JWT
-  local token = decodeJwt(txn.sf:req_hdr("Authorization"))
+  local token = decodeJwt(authHeader)
 
   if token == nil then
     log("Token could not be decoded.")
@@ -275,6 +338,12 @@ local function jwtverify(txn)
   if audience ~= nil and audienceIsValid(token, audience) == false then
     log("Audience not valid.")
     goto out
+  end
+
+  -- Cache this verified token until its own expiry so subsequent presentations
+  -- of the same token skip decode and signature verification.
+  if authHeader ~= nil and type(token.payloaddecoded.exp) == "number" then
+    verifiedCachePut(authHeader, token.payloaddecoded, token.payloaddecoded.exp)
   end
 
   -- 8. Set authorized variable
