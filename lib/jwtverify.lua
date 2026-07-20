@@ -131,11 +131,22 @@ local function algorithmIsValid(token)
   return true
 end
 
-local function rs256SignatureIsValid(token, publicKeys)
+local function rs256SignatureIsValid(token, parsedKeys, publicKeys)
   local digest = openssl.digest.new('SHA256')
   digest:update(token.header .. '.' .. token.payload)
-  
-  -- Try each public key until we find one that works
+
+  -- Prefer keys parsed once at init; fall back to parsing on demand if the
+  -- pre-parse step produced nothing (e.g. a key format openssl.pkey rejected).
+  if parsedKeys ~= nil and #parsedKeys > 0 then
+    for _, vkey in ipairs(parsedKeys) do
+      if vkey:verify(token.signaturedecoded, digest) then
+        return true
+      end
+    end
+    return false
+  end
+
+  -- Fallback: parse each PEM per request (original behaviour)
   for _, publicKey in ipairs(publicKeys) do
     local vkey = openssl.pkey.new(publicKey)
     local isVerified = vkey:verify(token.signaturedecoded, digest)
@@ -143,7 +154,7 @@ local function rs256SignatureIsValid(token, publicKeys)
       return true
     end
   end
-  
+
   return false
 end
 
@@ -227,7 +238,7 @@ local function jwtverify(txn)
 
   -- 3. Verify the signature with the certificate
   if token.headerdecoded.alg == 'RS256' then
-    if rs256SignatureIsValid(token, config.publicKeys) == false then
+    if rs256SignatureIsValid(token, config.parsedKeys, config.publicKeys) == false then
       log("Signature not valid for any provided public key.")
       goto out
     end
@@ -288,6 +299,20 @@ core.register_init(function()
       local pem = readAll(path)
       table.insert(config.publicKeys, pem)
       log("Loaded public key from: " .. path)
+    end
+  end
+
+  -- Pre-parse the PEMs into key objects once, so signature verification does
+  -- not rebuild them on every request (they are immutable for the process
+  -- lifetime). rs256SignatureIsValid falls back to per-request parsing if this
+  -- yields nothing.
+  config.parsedKeys = {}
+  for _, pem in ipairs(config.publicKeys) do
+    local ok, vkey = pcall(openssl.pkey.new, pem)
+    if ok and vkey ~= nil then
+      table.insert(config.parsedKeys, vkey)
+    else
+      log("Failed to pre-parse a public key; will fall back to per-request parse.")
     end
   end
   
