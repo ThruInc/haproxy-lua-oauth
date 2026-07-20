@@ -23,7 +23,7 @@
 -- Default/fallback config
 if not config then
   config = {
-      debug = true,
+      debug = false,
       publicKeys = {},
       issuer = nil,
       audience = nil,
@@ -49,6 +49,12 @@ local function log(msg)
   if config.debug then
       core.Debug(tostring(msg))
   end
+end
+
+-- Denial reasons and cache flushes log unconditionally: with debug off (the
+-- default) the proxy must still record *why* a request was rejected.
+local function warn(msg)
+  core.Warning(tostring(msg))
 end
 
 local function dump(o)
@@ -94,12 +100,12 @@ local function decodeJwt(authorizationHeader)
   local headerFields = core.tokenize(authorizationHeader, " .")
 
   if #headerFields ~= 4 then
-      log("Improperly formated Authorization header. Should be 'Bearer' followed by 3 token sections.")
+      warn("Improperly formated Authorization header. Should be 'Bearer' followed by 3 token sections.")
       return nil
   end
 
   if headerFields[1] ~= 'Bearer' then
-      log("Improperly formated Authorization header. Missing 'Bearer' property.")
+      warn("Improperly formated Authorization header. Missing 'Bearer' property.")
       return nil
   end
 
@@ -113,37 +119,39 @@ local function decodeJwt(authorizationHeader)
   token.signature = headerFields[4]
   token.signaturedecoded = base64.decode(token.signature)
 
-  log('Decoded JWT header: ' .. dump(token.headerdecoded))
-  log('Decoded JWT payload: ' .. dump(token.payloaddecoded))
+  -- Guard the dump() calls: Lua evaluates arguments eagerly, so without this
+  -- the recursive dump() + string concat ran on every request even when
+  -- debug logging was disabled.
+  if config.debug then
+    log('Decoded JWT header: ' .. dump(token.headerdecoded))
+    log('Decoded JWT payload: ' .. dump(token.payloaddecoded))
+  end
 
   return token
 end
 
 local function algorithmIsValid(token)
   if token.headerdecoded.alg == nil then
-      log("No 'alg' provided in JWT header.")
+      warn("No 'alg' provided in JWT header.")
       return false
   elseif token.headerdecoded.alg ~= 'HS256' and  token.headerdecoded.alg ~= 'HS512' and token.headerdecoded.alg ~= 'RS256' then
-      log("HS256, HS512 and RS256 supported. Incorrect alg in JWT: " .. token.headerdecoded.alg)
+      warn("HS256, HS512 and RS256 supported. Incorrect alg in JWT: " .. token.headerdecoded.alg)
       return false
   end
 
   return true
 end
 
-local function rs256SignatureIsValid(token, publicKeys)
+local function rs256SignatureIsValid(token, parsedKeys)
   local digest = openssl.digest.new('SHA256')
   digest:update(token.header .. '.' .. token.payload)
-  
-  -- Try each public key until we find one that works
-  for _, publicKey in ipairs(publicKeys) do
-    local vkey = openssl.pkey.new(publicKey)
-    local isVerified = vkey:verify(token.signaturedecoded, digest)
-    if isVerified then
+
+  for _, vkey in ipairs(parsedKeys) do
+    if vkey:verify(token.signaturedecoded, digest) then
       return true
     end
   end
-  
+
   return false
 end
 
@@ -203,13 +211,103 @@ local function setVariablesFromPayload(txn, decodedPayload)
   end
 end
 
+-- In-process cache of successfully verified tokens.
+--
+-- Key   = SHA-256 of the exact Authorization header value ("Bearer <jwt>"),
+--         so plaintext bearer tokens do not accumulate in the Lua heap (or
+--         appear in a core dump) for their whole lifetime.
+-- Value = { payload = <decoded claims>, exp = <numeric exp> }.
+--
+-- Only positive results are cached, keyed on a collision-resistant hash of the
+-- exact token bytes: a tampered or forged token differs by at least one byte,
+-- so it can never collide with a cached entry -- it misses the cache and goes
+-- through full signature verification (and is rejected). Expiry is re-checked
+-- on every hit, so an entry is never honoured past the token's own 'exp'; the
+-- effective revocation window therefore equals the token lifetime.
+--
+-- Issuer, audience and the HMAC secret are validated only at cache-fill time,
+-- so a cached entry authorizes under the policy in effect when it was
+-- inserted. Safe today: those config values are init-time constants, and a
+-- config reload spawns a fresh Lua state with an empty cache. If config ever
+-- becomes runtime-reloadable, flush this cache on reload.
+--
+-- Under 'lua-load' this table lives in the single shared Lua state and is
+-- coherent across threads (Lua runs under HAProxy's global lock). Under
+-- 'lua-load-per-thread' each thread keeps its own cache -- still correct, just
+-- a lower hit rate.
+local verifiedCache = {}
+local verifiedCacheSize = 0
+local VERIFIED_CACHE_MAX = 8192
+
+local function verifiedCacheKey(authHeader)
+  local digest = openssl.digest.new('SHA256')
+  digest:update(authHeader)
+  return digest:final()
+end
+
+local function verifiedCacheRemove(key)
+  if verifiedCache[key] ~= nil then
+    verifiedCache[key] = nil
+    verifiedCacheSize = verifiedCacheSize - 1
+  end
+end
+
+local function verifiedCachePurgeExpired(now)
+  for k, v in pairs(verifiedCache) do
+    if v.exp <= now then
+      verifiedCacheRemove(k)
+    end
+  end
+end
+
+local function verifiedCachePut(key, payload, exp)
+  if verifiedCache[key] == nil then
+    if verifiedCacheSize >= VERIFIED_CACHE_MAX then
+      -- Bounded: drop expired entries first; if still full, clear the table.
+      -- Worst case we re-verify a few tokens -- correctness is unaffected.
+      verifiedCachePurgeExpired(core.now().sec)
+      if verifiedCacheSize >= VERIFIED_CACHE_MAX then
+        -- Loud on purpose: a working set of live tokens above the cap means
+        -- periodic full re-verification (CPU sawtooth), not a correctness bug.
+        warn("jwtverify: verified-token cache flushed at " .. verifiedCacheSize
+          .. " live entries; working set exceeds VERIFIED_CACHE_MAX")
+        verifiedCache = {}
+        verifiedCacheSize = 0
+      end
+    end
+    verifiedCacheSize = verifiedCacheSize + 1
+  end
+  verifiedCache[key] = { payload = payload, exp = exp }
+end
+
 local function jwtverify(txn)
   local issuer = config.issuer
   local audience = config.audience
   local hmacSecret = config.hmacSecret
 
+  local authHeader = txn.sf:req_hdr("Authorization")
+  local cacheKey = nil
+
+  -- Fast path: a token we have already fully verified and that has not yet
+  -- expired. Skips JSON decode and signature verification entirely.
+  if authHeader ~= nil then
+    cacheKey = verifiedCacheKey(authHeader)
+    local cached = verifiedCache[cacheKey]
+    if cached ~= nil then
+      if cached.exp > core.now().sec then
+        setVariablesFromPayload(txn, cached.payload)
+        log("req.authorized = true (cached)")
+        txn.set_var(txn, "txn.oauth_cache", "hit")
+        txn.set_var(txn, "txn.authorized", true)
+        return
+      end
+      -- Expired: drop it and fall through to full verification.
+      verifiedCacheRemove(cacheKey)
+    end
+  end
+
   -- 1. Decode and parse the JWT
-  local token = decodeJwt(txn.sf:req_hdr("Authorization"))
+  local token = decodeJwt(authHeader)
 
   if token == nil then
     log("Token could not be decoded.")
@@ -227,42 +325,52 @@ local function jwtverify(txn)
 
   -- 3. Verify the signature with the certificate
   if token.headerdecoded.alg == 'RS256' then
-    if rs256SignatureIsValid(token, config.publicKeys) == false then
-      log("Signature not valid for any provided public key.")
+    if rs256SignatureIsValid(token, config.parsedKeys) == false then
+      warn("Signature not valid for any provided public key.")
       goto out
     end
   elseif token.headerdecoded.alg == 'HS256' then
     if hs256SignatureIsValid(token, hmacSecret) == false then
-      log("Signature not valid.")
+      warn("Signature not valid.")
       goto out
     end
   elseif token.headerdecoded.alg == 'HS512' then
     if hs512SignatureIsValid(token, hmacSecret) == false then
-      log("Signature not valid.")
+      warn("Signature not valid.")
       goto out
     end
   end
 
   -- 4. Verify that the token is not expired
   if expirationIsValid(token) == false then
-    log("Token is expired.")
+    warn("Token is expired.")
     goto out
   end
 
   -- 5. Verify the issuer
   if issuer ~= nil and issuerIsValid(token, issuer) == false then
-    log("Issuer not valid.")
+    warn("Issuer not valid.")
     goto out
   end
 
   -- 6. Verify the audience
   if audience ~= nil and audienceIsValid(token, audience) == false then
-    log("Audience not valid.")
+    warn("Audience not valid.")
     goto out
+  end
+
+  -- Cache this verified token until its own expiry so subsequent presentations
+  -- of the same token skip decode and signature verification.
+  if cacheKey ~= nil and type(token.payloaddecoded.exp) == "number" then
+    verifiedCachePut(cacheKey, token.payloaddecoded, token.payloaddecoded.exp)
   end
 
   -- 8. Set authorized variable
   log("req.authorized = true")
+  -- 'miss' = authorized via full verification (and now cached). Exposed so the
+  -- access-log format can record cache effectiveness in production; requests
+  -- denied before this point leave the variable unset.
+  txn.set_var(txn, "txn.oauth_cache", "miss")
   txn.set_var(txn, "txn.authorized", true)
 
   -- exit
@@ -280,6 +388,14 @@ core.register_init(function()
   config.issuer = os.getenv("OAUTH_ISSUER")
   config.audience = os.getenv("OAUTH_AUDIENCE")
   config.keyPaths = os.getenv("OAUTH_KEY_PATHS")
+
+  -- Debug defaults off (see fallback config). Set OAUTH_DEBUG=true (or 1/yes)
+  -- to re-enable verbose per-request logging.
+  local debugEnv = os.getenv("OAUTH_DEBUG")
+  if debugEnv ~= nil then
+    debugEnv = debugEnv:lower()
+    config.debug = (debugEnv == "true" or debugEnv == "1" or debugEnv == "yes")
+  end
   
   -- Load all public keys from the provided paths
   if config.keyPaths ~= nil then
@@ -289,6 +405,26 @@ core.register_init(function()
       table.insert(config.publicKeys, pem)
       log("Loaded public key from: " .. path)
     end
+  end
+
+  -- Pre-parse the PEMs into key objects once, so signature verification does
+  -- not rebuild them on every request (they are immutable for the process
+  -- lifetime). A key that fails to parse here could never have verified a
+  -- signature anyway, so alert loudly; if none parse, abort startup rather
+  -- than run a proxy that rejects every RS256 token.
+  config.parsedKeys = {}
+  for i, pem in ipairs(config.publicKeys) do
+    local ok, vkey = pcall(openssl.pkey.new, pem)
+    if ok and vkey ~= nil then
+      table.insert(config.parsedKeys, vkey)
+    else
+      core.Alert("jwtverify: failed to parse public key " .. i .. " of "
+        .. #config.publicKeys .. ": " .. tostring(vkey))
+    end
+  end
+  if #config.publicKeys > 0 and #config.parsedKeys == 0 then
+    error("jwtverify: none of the " .. #config.publicKeys
+      .. " configured public keys could be parsed; aborting startup")
   end
   
   -- when using an HS256 or HS512 signature

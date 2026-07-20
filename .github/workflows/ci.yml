@@ -1,0 +1,100 @@
+name: CI
+
+# PR check + master push gate for haproxy-lua-oauth.
+#
+# This is a standalone workflow, not a call into ThruInc/Thru.Workflows:
+# that reusable-workflow suite (test-app / publish-app / publish-docker /
+# sonarqube-analysis) is .NET/Octopus-specific and does not fit a bare
+# Lua 5.4 script repo. We mirror the org conventions that DO apply --
+# ubuntu-latest for build/test-style jobs, an explicit least-privilege
+# permissions block, and PR concurrency with cancel-in-progress (as in
+# ThruInc/Thru.Workflows/.github/workflows/claude-pr-review.yml).
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+
+# Least privilege: these jobs only read the checked-out tree.
+permissions:
+  contents: read
+
+# One in-flight run per PR (or per branch/tag on push); a new push cancels
+# the previous run for the same ref instead of stacking.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lua-tests:
+    name: Lua tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Install lua5.4
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y lua5.4
+
+      - name: Run test suite
+        run: |
+          chmod +x test/run.sh
+          ./test/run.sh
+
+  parse-check:
+    name: Parse check (luac5.4 -p)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      # lua5.4 pulls in the luac5.4 bytecode compiler used below.
+      - name: Install lua5.4
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y lua5.4
+
+      # luac -p compiles-and-discards, so it is a pure syntax check against
+      # the exact interpreter version HAProxy runs in prod. Fails the job on
+      # the first file that does not parse.
+      - name: Syntax-check lib/*.lua
+        run: |
+          shopt -s nullglob
+          files=(lib/*.lua)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No lib/*.lua files found" >&2
+            exit 1
+          fi
+          for f in "${files[@]}"; do
+            echo "luac5.4 -p $f"
+            luac5.4 -p "$f"
+          done
+
+  # ---------------------------------------------------------------------------
+  # OPTIONAL: luacheck static analysis. Left disabled on purpose.
+  #
+  # Verdict: NOT worth turning on for this repo right now. luacheck is not in
+  # the Ubuntu apt repos, so it has to come via luarocks (which pulls a Lua
+  # dev toolchain), and jwtverify.lua is written against HAProxy's embedded
+  # Lua runtime -- it references globals injected by HAProxy (core, etc.) and
+  # bundled libs that a bare luacheck flags as "undefined global" / "unused".
+  # Without a curated .luacheckrc (globals allowlist + ignore rules) it would
+  # be noise, and the test suite + parse-check already cover correctness and
+  # syntax with zero extra deps. Revisit if lib/ grows real internal modules.
+  #
+  # luacheck:
+  #   name: luacheck (lint)
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - name: Check out code
+  #       uses: actions/checkout@v4
+  #     - name: Install luacheck
+  #       run: |
+  #         sudo apt-get update
+  #         sudo apt-get install -y lua5.4 luarocks
+  #         sudo luarocks install luacheck
+  #     - name: Run luacheck
+  #       run: luacheck lib/ --no-color
