@@ -356,6 +356,7 @@ do
   check(txn.vars["txn.authorized"] == true, "authorized == true")
   check(txn.vars["txn.oauth.iss"] == ISSUER, "txn.oauth.iss set from payload")
   check(txn.vars["txn.oauth.aud"] == AUDIENCE, "txn.oauth.aud set from payload")
+  check(txn.vars["txn.oauth_cache"] == "miss", "full verification records oauth_cache=miss")
 end
 
 -- 2. Repeat of same header hits the cache: signature verify is NOT re-run,
@@ -377,6 +378,7 @@ do
   check(state.verifyCount == afterFirst, "second (cached) call does NOT verify again")
   check(txn2.vars["txn.authorized"] == true, "cached call authorized")
   check(txn2.vars["txn.oauth.iss"] == ISSUER, "cached call repopulates payload vars")
+  check(txn2.vars["txn.oauth_cache"] == "hit", "cached call records oauth_cache=hit")
 end
 
 -- 3. Tampered token (different bytes -> cache miss) is verified and rejected.
@@ -390,6 +392,7 @@ do
   action(txn)
   check(state.verifyCount == before + 1, "signature verify WAS attempted (cache miss)")
   check(txn.vars["txn.authorized"] == false, "authorized == false")
+  check(txn.vars["txn.oauth_cache"] == nil, "denied request leaves oauth_cache unset")
 end
 
 -- 4a. Expired token is denied.

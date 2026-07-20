@@ -271,6 +271,7 @@ local function jwtverify(txn)
       if cached.exp > core.now().sec then
         setVariablesFromPayload(txn, cached.payload)
         log("req.authorized = true (cached)")
+        txn.set_var(txn, "txn.oauth_cache", "hit")
         txn.set_var(txn, "txn.authorized", true)
         return
       end
@@ -340,6 +341,10 @@ local function jwtverify(txn)
 
   -- 8. Set authorized variable
   log("req.authorized = true")
+  -- 'miss' = authorized via full verification (and now cached). Exposed so the
+  -- access-log format can record cache effectiveness in production; requests
+  -- denied before this point leave the variable unset.
+  txn.set_var(txn, "txn.oauth_cache", "miss")
   txn.set_var(txn, "txn.authorized", true)
 
   -- exit
