@@ -225,6 +225,12 @@ end
 -- on every hit, so an entry is never honoured past the token's own 'exp'; the
 -- effective revocation window therefore equals the token lifetime.
 --
+-- Issuer, audience and the HMAC secret are validated only at cache-fill time,
+-- so a cached entry authorizes under the policy in effect when it was
+-- inserted. Safe today: those config values are init-time constants, and a
+-- config reload spawns a fresh Lua state with an empty cache. If config ever
+-- becomes runtime-reloadable, flush this cache on reload.
+--
 -- Under 'lua-load' this table lives in the single shared Lua state and is
 -- coherent across threads (Lua runs under HAProxy's global lock). Under
 -- 'lua-load-per-thread' each thread keeps its own cache -- still correct, just
