@@ -218,7 +218,16 @@ end
 package.preload["openssl.digest"] = function()
   return {
     new = function(_algo)
-      return { updated = "", update = function(self, data) self.updated = self.updated .. data end }
+      return {
+        updated = "",
+        update = function(self, data) self.updated = self.updated .. data end,
+        -- Fake digest is injective on its input (identity-tagged), which is
+        -- all the cache-key derivation needs from SHA-256 here.
+        final = function(self, data)
+          if data then self.updated = self.updated .. data end
+          return "sha256(" .. self.updated .. ")"
+        end,
+      }
     end,
   }
 end

@@ -213,15 +213,17 @@ end
 
 -- In-process cache of successfully verified tokens.
 --
--- Key   = the exact Authorization header value (full "Bearer <jwt>").
+-- Key   = SHA-256 of the exact Authorization header value ("Bearer <jwt>"),
+--         so plaintext bearer tokens do not accumulate in the Lua heap (or
+--         appear in a core dump) for their whole lifetime.
 -- Value = { payload = <decoded claims>, exp = <numeric exp> }.
 --
--- Only positive results are cached, keyed on the exact token bytes: a tampered
--- or forged token differs by at least one byte, so it can never collide with a
--- cached entry -- it misses the cache and goes through full signature
--- verification (and is rejected). Expiry is re-checked on every hit, so an
--- entry is never honoured past the token's own 'exp'; the effective revocation
--- window therefore equals the token lifetime.
+-- Only positive results are cached, keyed on a collision-resistant hash of the
+-- exact token bytes: a tampered or forged token differs by at least one byte,
+-- so it can never collide with a cached entry -- it misses the cache and goes
+-- through full signature verification (and is rejected). Expiry is re-checked
+-- on every hit, so an entry is never honoured past the token's own 'exp'; the
+-- effective revocation window therefore equals the token lifetime.
 --
 -- Under 'lua-load' this table lives in the single shared Lua state and is
 -- coherent across threads (Lua runs under HAProxy's global lock). Under
@@ -230,6 +232,12 @@ end
 local verifiedCache = {}
 local verifiedCacheSize = 0
 local VERIFIED_CACHE_MAX = 8192
+
+local function verifiedCacheKey(authHeader)
+  local digest = openssl.digest.new('SHA256')
+  digest:update(authHeader)
+  return digest:final()
+end
 
 local function verifiedCacheRemove(key)
   if verifiedCache[key] ~= nil then
@@ -272,11 +280,13 @@ local function jwtverify(txn)
   local hmacSecret = config.hmacSecret
 
   local authHeader = txn.sf:req_hdr("Authorization")
+  local cacheKey = nil
 
   -- Fast path: a token we have already fully verified and that has not yet
   -- expired. Skips JSON decode and signature verification entirely.
   if authHeader ~= nil then
-    local cached = verifiedCache[authHeader]
+    cacheKey = verifiedCacheKey(authHeader)
+    local cached = verifiedCache[cacheKey]
     if cached ~= nil then
       if cached.exp > core.now().sec then
         setVariablesFromPayload(txn, cached.payload)
@@ -286,7 +296,7 @@ local function jwtverify(txn)
         return
       end
       -- Expired: drop it and fall through to full verification.
-      verifiedCacheRemove(authHeader)
+      verifiedCacheRemove(cacheKey)
     end
   end
 
@@ -345,8 +355,8 @@ local function jwtverify(txn)
 
   -- Cache this verified token until its own expiry so subsequent presentations
   -- of the same token skip decode and signature verification.
-  if authHeader ~= nil and type(token.payloaddecoded.exp) == "number" then
-    verifiedCachePut(authHeader, token.payloaddecoded, token.payloaddecoded.exp)
+  if cacheKey ~= nil and type(token.payloaddecoded.exp) == "number" then
+    verifiedCachePut(cacheKey, token.payloaddecoded, token.payloaddecoded.exp)
   end
 
   -- 8. Set authorized variable
