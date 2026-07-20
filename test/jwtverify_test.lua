@@ -278,23 +278,16 @@ _G.core = {
 -- as the global `config` before load so we exercise the file's own env/key
 -- plumbing via the captured init function.
 --
--- Lua 5.5 compatibility shim (TEST-ONLY): line 58 of jwtverify.lua reassigns
--- the generic-for control variable `k`, which Lua >= 5.5 treats as const and
--- rejects at PARSE time. We shadow it with a fresh mutable local so the byte
--- semantics are identical; the file on disk is never modified.
+-- Runs under the same Lua that ships in the HAProxy image (Lua 5.4). We do NOT
+-- rewrite the source: the test must load lib/jwtverify.lua byte-for-byte as
+-- prod does. (Note: Lua >= 5.5 makes generic-for control variables const and
+-- would reject line 58 of jwtverify.lua at parse time -- but prod/devbox pin
+-- 5.4, so run this suite with lua5.4, not a stray newer interpreter.)
 --------------------------------------------------------------------------------
 local function loadModule(cfg)
   local f = assert(io.open(JWTVERIFY_PATH, "r"))
   local src = f:read("*a")
   f:close()
-
-  local major, minor = _VERSION:match("Lua (%d+)%.(%d+)")
-  if tonumber(major) > 5 or (tonumber(major) == 5 and tonumber(minor) >= 5) then
-    src = src:gsub(
-      "if type%(k%) ~= 'number' then k = '\"'%.%.k%.%.'\"' end",
-      "local k = k; if type(k) ~= 'number' then k = '\"'..k..'\"' end",
-      1)
-  end
 
   captured.init, captured.action = nil, nil
   _G.config = cfg
