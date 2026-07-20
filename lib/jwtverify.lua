@@ -225,11 +225,17 @@ local verifiedCache = {}
 local verifiedCacheSize = 0
 local VERIFIED_CACHE_MAX = 8192
 
+local function verifiedCacheRemove(key)
+  if verifiedCache[key] ~= nil then
+    verifiedCache[key] = nil
+    verifiedCacheSize = verifiedCacheSize - 1
+  end
+end
+
 local function verifiedCachePurgeExpired(now)
   for k, v in pairs(verifiedCache) do
     if v.exp <= now then
-      verifiedCache[k] = nil
-      verifiedCacheSize = verifiedCacheSize - 1
+      verifiedCacheRemove(k)
     end
   end
 end
@@ -264,12 +270,12 @@ local function jwtverify(txn)
     if cached ~= nil then
       if cached.exp > core.now().sec then
         setVariablesFromPayload(txn, cached.payload)
+        log("req.authorized = true (cached)")
         txn.set_var(txn, "txn.authorized", true)
         return
       end
       -- Expired: drop it and fall through to full verification.
-      verifiedCache[authHeader] = nil
-      verifiedCacheSize = verifiedCacheSize - 1
+      verifiedCacheRemove(authHeader)
     end
   end
 
@@ -352,10 +358,12 @@ core.register_init(function()
   config.audience = os.getenv("OAUTH_AUDIENCE")
   config.keyPaths = os.getenv("OAUTH_KEY_PATHS")
 
-  -- Debug defaults off (see fallback config). Set OAUTH_DEBUG=true to re-enable
-  -- verbose per-request logging.
-  if os.getenv("OAUTH_DEBUG") ~= nil then
-    config.debug = (os.getenv("OAUTH_DEBUG") == "true")
+  -- Debug defaults off (see fallback config). Set OAUTH_DEBUG=true (or 1/yes)
+  -- to re-enable verbose per-request logging.
+  local debugEnv = os.getenv("OAUTH_DEBUG")
+  if debugEnv ~= nil then
+    debugEnv = debugEnv:lower()
+    config.debug = (debugEnv == "true" or debugEnv == "1" or debugEnv == "yes")
   end
   
   -- Load all public keys from the provided paths
